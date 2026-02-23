@@ -1,0 +1,21 @@
+apply plugin: 'com.android.library'
+
+android {
+    namespace "com.microsoft.codepush.react"
+    compileSdkVersion rootProject.ext.compileSdkVersion ?: 34
+    buildToolsVersion rootProject.ext.buildToolsVersion ?: "34.0.0"
+    
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion ?: 21
+        targetSdkVersion rootProject.ext.targetSdkVersion ?: 34
+    }
+}
+
+repositories {
+    mavenCentral()
+    google()
+}
+
+dependencies {
+    implementation 'com.facebook.react:react-native:+'
+}

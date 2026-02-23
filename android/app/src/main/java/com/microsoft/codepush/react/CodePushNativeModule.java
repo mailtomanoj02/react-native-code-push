@@ -1,0 +1,858 @@
+package com.microsoft.codepush.react;
+
+import android.app.Activity;
+import android.content.SharedPreferences;
+import android.os.AsyncTask;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.View;
+import android.view.Choreographer;
+
+import androidx.annotation.OptIn;
+
+import com.facebook.react.ReactApplication;
+import com.facebook.react.ReactDelegate;
+import com.facebook.react.ReactHost;
+import com.facebook.react.ReactActivity;
+import com.facebook.react.ReactInstanceEventListener;
+import com.facebook.react.ReactInstanceManager;
+import com.facebook.react.ReactRootView;
+import com.facebook.react.bridge.Arguments;
+import com.facebook.react.bridge.JSBundleLoader;
+import com.facebook.react.bridge.LifecycleEventListener;
+import com.facebook.react.bridge.Promise;
+import com.facebook.react.bridge.ReactApplicationContext;
+import com.facebook.react.bridge.ReactContext;
+import com.facebook.react.bridge.ReactContextBaseJavaModule;
+import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.common.LifecycleState;
+import com.facebook.react.common.annotations.UnstableReactNativeAPI;
+import com.facebook.react.modules.core.DeviceEventManagerModule;
+import com.facebook.react.modules.core.ReactChoreographer;
+import com.facebook.react.runtime.ReactHostDelegate;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+public class CodePushNativeModule extends ReactContextBaseJavaModule {
+    private String mBinaryContentsHash = null;
+    private String mClientUniqueId = null;
+    private LifecycleEventListener mLifecycleEventListener = null;
+    private int mMinimumBackgroundDuration = 0;
+
+    private CodePush mCodePush;
+    private SettingsManager mSettingsManager;
+    private CodePushTelemetryManager mTelemetryManager;
+    private CodePushUpdateManager mUpdateManager;
+
+    private  boolean _allowed = true;
+    private  boolean _restartInProgress = false;
+    private  ArrayList<Boolean> _restartQueue = new ArrayList<>();
+
+    public CodePushNativeModule(ReactApplicationContext reactContext, CodePush codePush, CodePushUpdateManager codePushUpdateManager, CodePushTelemetryManager codePushTelemetryManager, SettingsManager settingsManager) {
+        super(reactContext);
+
+        mCodePush = codePush;
+        mSettingsManager = settingsManager;
+        mTelemetryManager = codePushTelemetryManager;
+        mUpdateManager = codePushUpdateManager;
+
+        // Initialize module state while we have a reference to the current context.
+        mBinaryContentsHash = CodePushUpdateUtils.getHashForBinaryContents(reactContext, mCodePush.isDebugMode());
+
+        SharedPreferences preferences = codePush.getContext().getSharedPreferences(CodePushConstants.CODE_PUSH_PREFERENCES, 0);
+        mClientUniqueId = preferences.getString(CodePushConstants.CLIENT_UNIQUE_ID_KEY, null);
+        if (mClientUniqueId == null) {
+            mClientUniqueId = UUID.randomUUID().toString();
+            preferences.edit().putString(CodePushConstants.CLIENT_UNIQUE_ID_KEY, mClientUniqueId).apply();
+        }
+    }
+
+    @Override
+    public Map<String, Object> getConstants() {
+        final Map<String, Object> constants = new HashMap<>();
+
+        constants.put("codePushInstallModeImmediate", CodePushInstallMode.IMMEDIATE.getValue());
+        constants.put("codePushInstallModeOnNextRestart", CodePushInstallMode.ON_NEXT_RESTART.getValue());
+        constants.put("codePushInstallModeOnNextResume", CodePushInstallMode.ON_NEXT_RESUME.getValue());
+        constants.put("codePushInstallModeOnNextSuspend", CodePushInstallMode.ON_NEXT_SUSPEND.getValue());
+
+        constants.put("codePushUpdateStateRunning", CodePushUpdateState.RUNNING.getValue());
+        constants.put("codePushUpdateStatePending", CodePushUpdateState.PENDING.getValue());
+        constants.put("codePushUpdateStateLatest", CodePushUpdateState.LATEST.getValue());
+
+        return constants;
+    }
+
+    @Override
+    public String getName() {
+        return "CodePush";
+    }
+
+    private void loadBundleLegacy() {
+        final Activity currentActivity = getReactApplicationContext().getCurrentActivity();
+        if (currentActivity == null) {
+            // The currentActivity can be null if it is backgrounded / destroyed, so we simply
+            // no-op to prevent any null pointer exceptions.
+            return;
+        }
+        mCodePush.invalidateCurrentInstance();
+
+        currentActivity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                currentActivity.recreate();
+            }
+        });
+    }
+
+    // Use reflection to find and set the appropriate fields on ReactInstanceManager. See #556 for a proposal for a less brittle way
+    // to approach this.
+    private void setJSBundle(String latestJSBundleFile) throws IllegalAccessException {
+        try {
+            JSBundleLoader latestJSBundleLoader;
+            if (latestJSBundleFile.toLowerCase().startsWith("assets://")) {
+                latestJSBundleLoader = JSBundleLoader.createAssetLoader(getReactApplicationContext(), latestJSBundleFile, false);
+            } else {
+                latestJSBundleLoader = JSBundleLoader.createFileLoader(latestJSBundleFile);
+            }
+
+            ReactHost reactHost = resolveReactHost();
+            if (reactHost == null) {
+                CodePushUtils.log("Unable to resolve ReactHost");
+                // Bridge, Old Architecture
+                setJSBundleLoaderBridge(latestJSBundleLoader);
+                return;
+            }
+
+            // Bridgeless (RN >= 0.74)
+            setJSBundleLoaderBridgeless(reactHost, latestJSBundleLoader);
+        } catch (Exception e) {
+            CodePushUtils.log("Unable to set JSBundle: " + e.getClass().getName() + ": " + e.getMessage());
+            if (e.getCause() != null) {
+            CodePushUtils.log("Caused by: " + e.getCause().getClass().getName() + ": " + e.getCause().getMessage());
+            }
+            IllegalAccessException ex = new IllegalAccessException("Could not setJSBundle");
+            ex.initCause(e);
+            throw ex;
+        }
+    }
+
+    private void setJSBundleLoaderBridge(JSBundleLoader latestJSBundleLoader) throws NoSuchFieldException, IllegalAccessException {
+        ReactDelegate reactDelegate = resolveReactDelegate();
+        assert reactDelegate != null;
+        ReactInstanceManager instanceManager = reactDelegate.getReactInstanceManager();
+        Field bundleLoaderField = instanceManager.getClass().getDeclaredField("mBundleLoader");
+        bundleLoaderField.setAccessible(true);
+        bundleLoaderField.set(instanceManager, latestJSBundleLoader);
+    }
+
+    @OptIn(markerClass = UnstableReactNativeAPI.class)
+    private void setJSBundleLoaderBridgeless(ReactHost reactHost, JSBundleLoader latestJSBundleLoader) throws NoSuchFieldException, IllegalAccessException {
+        Field reactHostDelegateField;
+        try {
+            // RN < 0.81
+            reactHostDelegateField = reactHost.getClass().getDeclaredField("mReactHostDelegate");
+        } catch (NoSuchFieldException e) {
+            // RN >= 0.81
+            reactHostDelegateField = reactHost.getClass().getDeclaredField("reactHostDelegate");
+        }
+        reactHostDelegateField.setAccessible(true);
+        ReactHostDelegate reactHostDelegate = (ReactHostDelegate) reactHostDelegateField.get(reactHost);
+        assert reactHostDelegate != null;
+        Field jsBundleLoaderField = reactHostDelegate.getClass().getDeclaredField("jsBundleLoader");
+        jsBundleLoaderField.setAccessible(true);
+        jsBundleLoaderField.set(reactHostDelegate, latestJSBundleLoader);
+    }
+
+    private void loadBundle() {
+        clearLifecycleEventListener();
+
+        try {
+            final String latestJSBundleFile = mCodePush.getJSBundleFileInternal(mCodePush.getAssetsBundleFileName());
+            final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+            mainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        setJSBundle(latestJSBundleFile);
+                    } catch (Exception e) {
+                        CodePushUtils.log("Failed to set JSBundle, falling back to reactHost.reload(). " + e.getMessage());
+                        try {
+                            Activity activity = getReactApplicationContext().getCurrentActivity();
+                            ReactHost reactHost = resolveReactHostDirect(activity);
+                            if (reactHost != null) {
+                                runReactHostReloadWhenReady(reactHost, activity, mainHandler);
+                            } else {
+                                loadBundleLegacy();
+                            }
+                        } catch (Exception e2) {
+                            CodePushUtils.log("Failed to reload, falling back to Activity restart. " + e2.getMessage());
+                            loadBundleLegacy();
+                        }
+                        return;
+                    }
+
+                    try {
+                        Activity activity = getReactApplicationContext().getCurrentActivity();
+                        ReactHost reactHost = resolveReactHostDirect(activity);
+
+                        if (reactHost != null) {
+                            runReactHostReloadWhenReady(reactHost, activity, mainHandler);
+                        } else {
+                            ReactDelegate reactDelegate = resolveReactDelegate();
+                            if (reactDelegate == null) {
+                                loadBundleLegacy();
+                                return;
+                            }
+                            resetReactRootViews(reactDelegate);
+                            reactDelegate.reload();
+                            mCodePush.initializeUpdateAfterRestart();
+                        }
+                    } catch (Exception e) {
+                        CodePushUtils.log("Failed to reload on main thread, falling back to Activity restart. " + e.getMessage());
+                        loadBundleLegacy();
+                    }
+                }
+            });
+
+        } catch (Exception e) {
+            CodePushUtils.log("Failed to load the bundle, falling back to restarting the Activity (if it exists). " + e.getMessage());
+            loadBundleLegacy();
+        }
+    }
+
+    /**
+     * Performs onHostResume (if needed), reload, and initializeUpdateAfterRestart.
+     * Call on main thread (from runnable or from ReactInstanceEventListener callback).
+     */
+    private void performReactHostReload(ReactHost reactHost, Activity activity) {
+        try {
+            if (reactHost.getLifecycleState() != LifecycleState.RESUMED && activity != null) {
+                reactHost.onHostResume(activity);
+            }
+            reactHost.reload("CodePush reload");
+            mCodePush.initializeUpdateAfterRestart();
+        } catch (Exception e) {
+            CodePushUtils.log("Failed to perform ReactHost reload, falling back to Activity restart. " + e.getMessage());
+            loadBundleLegacy();
+        }
+    }
+
+    /**
+     * If ReactContext is already initialized, runs reload immediately on this thread (main).
+     * Otherwise registers a one-shot listener and runs reload when context is ready (mirrors HotUpdater waitForReactContextInitialized).
+     */
+    private void runReactHostReloadWhenReady(final ReactHost reactHost, final Activity activity, final Handler mainHandler) {
+        if (reactHost.getCurrentReactContext() != null) {
+            performReactHostReload(reactHost, activity);
+            return;
+        }
+        final ReactInstanceEventListener listener = new ReactInstanceEventListener() {
+            @Override
+            public void onReactContextInitialized(ReactContext context) {
+                reactHost.removeReactInstanceEventListener(this);
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        performReactHostReload(reactHost, activity);
+                    }
+                });
+            }
+        };
+        reactHost.addReactInstanceEventListener(listener);
+    }
+
+    // Fix freezing that occurs when reloading the app (RN >= 0.77.1 Old Architecture)
+    //  - "Trying to add a root view with an explicit id (11) already set.
+    //     React Native uses the id field to track react tags and will overwrite this field.
+    //     If that is fine, explicitly overwrite the id field to View.NO_ID before calling addRootView."
+    private void resetReactRootViews(ReactDelegate reactDelegate) {
+        ReactActivity currentActivity = (ReactActivity) getReactApplicationContext().getCurrentActivity();
+        if (currentActivity != null) {
+            ReactRootView reactRootView = reactDelegate.getReactRootView();
+            if (reactRootView != null) {
+                reactRootView.removeAllViews();
+                reactRootView.setId(View.NO_ID);
+            }
+        }
+    }
+
+    private void clearLifecycleEventListener() {
+        // Remove LifecycleEventListener to prevent infinite restart loop
+        if (mLifecycleEventListener != null) {
+            getReactApplicationContext().removeLifecycleEventListener(mLifecycleEventListener);
+            mLifecycleEventListener = null;
+        }
+    }
+
+    private ReactDelegate resolveReactDelegate() {
+        ReactActivity currentActivity = (ReactActivity) getReactApplicationContext().getCurrentActivity();
+        if (currentActivity == null) {
+            return null;
+        }
+
+        return currentActivity.getReactDelegate();
+    }
+
+    /**
+     * Resolves ReactHost directly from ReactApplication — mirrors T2SAppReloaderModule.
+     * More reliable than going through ReactDelegate in New Architecture (Bridgeless).
+     */
+    private ReactHost resolveReactHostDirect(Activity activity) {
+        if (activity == null) return null;
+        if (!(activity.getApplication() instanceof ReactApplication)) return null;
+        ReactApplication reactApplication = (ReactApplication) activity.getApplication();
+        return reactApplication.getReactHost();
+    }
+
+    private ReactHost resolveReactHost() {
+        Activity activity = getReactApplicationContext().getCurrentActivity();
+        ReactHost directHost = resolveReactHostDirect(activity);
+        if (directHost != null) {
+            return directHost;
+        }
+        // Fallback: try via ReactDelegate (Old Architecture)
+        ReactDelegate reactDelegate = resolveReactDelegate();
+        if (reactDelegate == null) {
+            CodePushUtils.log("Unable to resolve ReactDelegate");
+            return null;
+        }
+        return reactDelegate.getReactHost();
+    }
+
+    private void restartAppInternal(boolean onlyIfUpdateIsPending) {
+        if (this._restartInProgress) {
+            CodePushUtils.log("Restart request queued until the current restart is completed");
+            this._restartQueue.add(onlyIfUpdateIsPending);
+            return;
+        } else if (!this._allowed) {
+            CodePushUtils.log("Restart request queued until restarts are re-allowed");
+            this._restartQueue.add(onlyIfUpdateIsPending);
+            return;
+        }
+
+        this._restartInProgress = true;
+        if (!onlyIfUpdateIsPending || mSettingsManager.isPendingUpdate(null)) {
+            loadBundle();
+            CodePushUtils.log("Restarting app");
+            return;
+        }
+
+        this._restartInProgress = false;
+        if (this._restartQueue.size() > 0) {
+            boolean buf = this._restartQueue.get(0);
+            this._restartQueue.remove(0);
+            this.restartAppInternal(buf);
+        }
+    }
+
+    @ReactMethod
+    public void allow(Promise promise) {
+        CodePushUtils.log("Re-allowing restarts");
+        this._allowed = true;
+
+        if (_restartQueue.size() > 0) {
+            CodePushUtils.log("Executing pending restart");
+            boolean buf = this._restartQueue.get(0);
+            this._restartQueue.remove(0);
+            this.restartAppInternal(buf);
+        }
+
+        promise.resolve(null);
+        return;
+    }
+
+    @ReactMethod
+    public void clearPendingRestart(Promise promise) {
+        this._restartQueue.clear();
+        promise.resolve(null);
+        return;
+    }
+
+    @ReactMethod
+    public void disallow(Promise promise) {
+        CodePushUtils.log("Disallowing restarts");
+        this._allowed = false;
+        promise.resolve(null);
+        return;
+    }
+
+    @ReactMethod
+    public void restartApp(boolean onlyIfUpdateIsPending, Promise promise) {
+        try {
+            restartAppInternal(onlyIfUpdateIsPending);
+            promise.resolve(null);
+        } catch(CodePushUnknownException e) {
+            CodePushUtils.log(e);
+            promise.reject(e);
+        }
+    }
+
+    @ReactMethod
+    public void downloadUpdate(final ReadableMap updatePackage, final boolean notifyProgress, final Promise promise) {
+        AsyncTask<Void, Void, Void> asyncTask = new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                try {
+                    JSONObject mutableUpdatePackage = CodePushUtils.convertReadableToJsonObject(updatePackage);
+                    mUpdateManager.downloadPackage(mutableUpdatePackage, mCodePush.getAssetsBundleFileName(), new DownloadProgressCallback() {
+                        private boolean hasScheduledNextFrame = false;
+                        private DownloadProgress latestDownloadProgress = null;
+
+                        @Override
+                        public void call(DownloadProgress downloadProgress) {
+                            if (!notifyProgress) {
+                                return;
+                            }
+
+                            latestDownloadProgress = downloadProgress;
+                            // If the download is completed, synchronously send the last event.
+                            if (latestDownloadProgress.isCompleted()) {
+                                dispatchDownloadProgressEvent();
+                                return;
+                            }
+
+                            if (hasScheduledNextFrame) {
+                                return;
+                            }
+
+                            hasScheduledNextFrame = true;
+                            getReactApplicationContext().runOnUiQueueThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    ReactChoreographer.getInstance().postFrameCallback(ReactChoreographer.CallbackType.TIMERS_EVENTS, new Choreographer.FrameCallback() {
+                                        @Override
+                                        public void doFrame(long frameTimeNanos) {
+                                            if (!latestDownloadProgress.isCompleted()) {
+                                                dispatchDownloadProgressEvent();
+                                            }
+
+                                            hasScheduledNextFrame = false;
+                                        }
+                                    });
+                                }
+                            });
+                        }
+
+                        public void dispatchDownloadProgressEvent() {
+                            getReactApplicationContext()
+                                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                                    .emit(CodePushConstants.DOWNLOAD_PROGRESS_EVENT_NAME, latestDownloadProgress.createWritableMap());
+                        }
+                    }, mCodePush.getPublicKey());
+
+                    JSONObject newPackage = mUpdateManager.getPackage(CodePushUtils.tryGetString(updatePackage, CodePushConstants.PACKAGE_HASH_KEY));
+                    promise.resolve(CodePushUtils.convertJsonObjectToWritable(newPackage));
+                } catch (CodePushInvalidUpdateException e) {
+                    CodePushUtils.log(e);
+                    mSettingsManager.saveFailedUpdate(CodePushUtils.convertReadableToJsonObject(updatePackage));
+                    promise.reject(e);
+                } catch (IOException | CodePushUnknownException e) {
+                    CodePushUtils.log(e);
+                    promise.reject(e);
+                }
+
+                return null;
+            }
+        };
+
+        asyncTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+    }
+
+    @ReactMethod
+    public void getConfiguration(Promise promise) {
+        try {
+            WritableMap configMap =  Arguments.createMap();
+            configMap.putString("appVersion", mCodePush.getAppVersion());
+            configMap.putString("clientUniqueId", mClientUniqueId);
+            configMap.putString("deploymentKey", mCodePush.getDeploymentKey());
+            configMap.putString("serverUrl", mCodePush.getServerUrl());
+
+            // The binary hash may be null in debug builds
+            if (mBinaryContentsHash != null) {
+                configMap.putString(CodePushConstants.PACKAGE_HASH_KEY, mBinaryContentsHash);
+            }
+
+            promise.resolve(configMap);
+        } catch(CodePushUnknownException e) {
+            CodePushUtils.log(e);
+            promise.reject(e);
+        }
+    }
+
+    @ReactMethod
+    public void getUpdateMetadata(final int updateState, final Promise promise) {
+        AsyncTask<Void, Void, Void> asyncTask = new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                try {
+                    JSONObject currentPackage = mUpdateManager.getCurrentPackage();
+
+                    if (currentPackage == null) {
+                        promise.resolve(null);
+                        return null;
+                    }
+
+                    Boolean currentUpdateIsPending = false;
+
+                    if (currentPackage.has(CodePushConstants.PACKAGE_HASH_KEY)) {
+                        String currentHash = currentPackage.optString(CodePushConstants.PACKAGE_HASH_KEY, null);
+                        currentUpdateIsPending = mSettingsManager.isPendingUpdate(currentHash);
+                    }
+
+                    if (updateState == CodePushUpdateState.PENDING.getValue() && !currentUpdateIsPending) {
+                        // The caller wanted a pending update
+                        // but there isn't currently one.
+                        promise.resolve(null);
+                    } else if (updateState == CodePushUpdateState.RUNNING.getValue() && currentUpdateIsPending) {
+                        // The caller wants the running update, but the current
+                        // one is pending, so we need to grab the previous.
+                        JSONObject previousPackage = mUpdateManager.getPreviousPackage();
+
+                        if (previousPackage == null) {
+                            promise.resolve(null);
+                            return null;
+                        }
+
+                        promise.resolve(CodePushUtils.convertJsonObjectToWritable(previousPackage));
+                    } else {
+                        // The current package satisfies the request:
+                        // 1) Caller wanted a pending, and there is a pending update
+                        // 2) Caller wanted the running update, and there isn't a pending
+                        // 3) Caller wants the latest update, regardless if it's pending or not
+                        if (mCodePush.isRunningBinaryVersion()) {
+                            // This only matters in Debug builds. Since we do not clear "outdated" updates,
+                            // we need to indicate to the JS side that somehow we have a current update on
+                            // disk that is not actually running.
+                            CodePushUtils.setJSONValueForKey(currentPackage, "_isDebugOnly", true);
+                        }
+
+                        // Enable differentiating pending vs. non-pending updates
+                        CodePushUtils.setJSONValueForKey(currentPackage, "isPending", currentUpdateIsPending);
+                        promise.resolve(CodePushUtils.convertJsonObjectToWritable(currentPackage));
+                    }
+                } catch (CodePushMalformedDataException e) {
+                    // We need to recover the app in case 'codepush.json' is corrupted
+                    CodePushUtils.log(e.getMessage());
+                    clearUpdates();
+                    promise.resolve(null);
+                } catch(CodePushUnknownException e) {
+                    CodePushUtils.log(e);
+                    promise.reject(e);
+                }
+
+                return null;
+            }
+        };
+
+        asyncTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+    }
+
+    @ReactMethod
+    public void getNewStatusReport(final Promise promise) {
+        AsyncTask<Void, Void, Void> asyncTask = new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                try {
+                    if (mCodePush.needToReportRollback()) {
+                        mCodePush.setNeedToReportRollback(false);
+                        JSONArray failedUpdates = mSettingsManager.getFailedUpdates();
+                        if (failedUpdates != null && failedUpdates.length() > 0) {
+                            try {
+                                JSONObject lastFailedPackageJSON = failedUpdates.getJSONObject(failedUpdates.length() - 1);
+                                WritableMap lastFailedPackage = CodePushUtils.convertJsonObjectToWritable(lastFailedPackageJSON);
+                                WritableMap failedStatusReport = mTelemetryManager.getRollbackReport(lastFailedPackage);
+                                if (failedStatusReport != null) {
+                                    promise.resolve(failedStatusReport);
+                                    return null;
+                                }
+                            } catch (JSONException e) {
+                                throw new CodePushUnknownException("Unable to read failed updates information stored in SharedPreferences.", e);
+                            }
+                        }
+                    } else if (mCodePush.didUpdate()) {
+                        JSONObject currentPackage = mUpdateManager.getCurrentPackage();
+                        if (currentPackage != null) {
+                            WritableMap newPackageStatusReport = mTelemetryManager.getUpdateReport(CodePushUtils.convertJsonObjectToWritable(currentPackage));
+                            if (newPackageStatusReport != null) {
+                                promise.resolve(newPackageStatusReport);
+                                return null;
+                            }
+                        }
+                    } else if (mCodePush.isRunningBinaryVersion()) {
+                        WritableMap newAppVersionStatusReport = mTelemetryManager.getBinaryUpdateReport(mCodePush.getAppVersion());
+                        if (newAppVersionStatusReport != null) {
+                            promise.resolve(newAppVersionStatusReport);
+                            return null;
+                        }
+                    } else {
+                        WritableMap retryStatusReport = mTelemetryManager.getRetryStatusReport();
+                        if (retryStatusReport != null) {
+                            promise.resolve(retryStatusReport);
+                            return null;
+                        }
+                    }
+
+                    promise.resolve("");
+                } catch(CodePushUnknownException e) {
+                    CodePushUtils.log(e);
+                    promise.reject(e);
+                }
+                return null;
+            }
+        };
+
+        asyncTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+    }
+
+    @ReactMethod
+    public void installUpdate(final ReadableMap updatePackage, final int installMode, final int minimumBackgroundDuration, final Promise promise) {
+        AsyncTask<Void, Void, Void> asyncTask = new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                try {
+                    mUpdateManager.installPackage(CodePushUtils.convertReadableToJsonObject(updatePackage), mSettingsManager.isPendingUpdate(null));
+
+                    String pendingHash = CodePushUtils.tryGetString(updatePackage, CodePushConstants.PACKAGE_HASH_KEY);
+                    if (pendingHash == null) {
+                        throw new CodePushUnknownException("Update package to be installed has no hash.");
+                    } else {
+                        mSettingsManager.savePendingUpdate(pendingHash, /* isLoading */false);
+                    }
+
+                    if (installMode == CodePushInstallMode.ON_NEXT_RESUME.getValue() ||
+                        // We also add the resume listener if the installMode is IMMEDIATE, because
+                        // if the current activity is backgrounded, we want to reload the bundle when
+                        // it comes back into the foreground.
+                        installMode == CodePushInstallMode.IMMEDIATE.getValue() ||
+                        installMode == CodePushInstallMode.ON_NEXT_SUSPEND.getValue()) {
+
+                        // Store the minimum duration on the native module as an instance
+                        // variable instead of relying on a closure below, so that any
+                        // subsequent resume-based installs could override it.
+                        CodePushNativeModule.this.mMinimumBackgroundDuration = minimumBackgroundDuration;
+
+                        if (mLifecycleEventListener == null) {
+                            // Ensure we do not add the listener twice.
+                            mLifecycleEventListener = new LifecycleEventListener() {
+                                private Date lastPausedDate = null;
+                                private Handler appSuspendHandler = new Handler(Looper.getMainLooper());
+                                private Runnable loadBundleRunnable = new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        CodePushUtils.log("Loading bundle on suspend");
+                                        restartAppInternal(false);
+                                    }
+                                };
+
+                                @Override
+                                public void onHostResume() {
+                                    appSuspendHandler.removeCallbacks(loadBundleRunnable);
+                                    // As of RN 36, the resume handler fires immediately if the app is in
+                                    // the foreground, so explicitly wait for it to be backgrounded first
+                                    if (lastPausedDate != null) {
+                                        long durationInBackground = (new Date().getTime() - lastPausedDate.getTime()) / 1000;
+                                        if (installMode == CodePushInstallMode.IMMEDIATE.getValue()
+                                                || durationInBackground >= CodePushNativeModule.this.mMinimumBackgroundDuration) {
+                                            CodePushUtils.log("Loading bundle on resume");
+                                            restartAppInternal(false);
+                                        }
+                                    }
+                                }
+
+                                @Override
+                                public void onHostPause() {
+                                    // Save the current time so that when the app is later
+                                    // resumed, we can detect how long it was in the background.
+                                    lastPausedDate = new Date();
+
+                                    if (installMode == CodePushInstallMode.ON_NEXT_SUSPEND.getValue() && mSettingsManager.isPendingUpdate(null)) {
+                                        appSuspendHandler.postDelayed(loadBundleRunnable, minimumBackgroundDuration * 1000);
+                                    }
+                                }
+
+                                @Override
+                                public void onHostDestroy() {
+                                }
+                            };
+
+                            getReactApplicationContext().addLifecycleEventListener(mLifecycleEventListener);
+                        }
+                    }
+
+                    promise.resolve("");
+                } catch(CodePushUnknownException e) {
+                    CodePushUtils.log(e);
+                    promise.reject(e);
+                }
+
+                return null;
+            }
+        };
+
+        asyncTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+    }
+
+    @ReactMethod
+    public void isFailedUpdate(String packageHash, Promise promise) {
+        try {
+            promise.resolve(mSettingsManager.isFailedHash(packageHash));
+        } catch (CodePushUnknownException e) {
+            CodePushUtils.log(e);
+            promise.reject(e);
+        }
+    }
+
+    @ReactMethod
+    public void getLatestRollbackInfo(Promise promise) {
+        try {
+            JSONObject latestRollbackInfo = mSettingsManager.getLatestRollbackInfo();
+            if (latestRollbackInfo != null) {
+                promise.resolve(CodePushUtils.convertJsonObjectToWritable(latestRollbackInfo));
+            } else {
+                promise.resolve(null);
+            }
+        } catch (CodePushUnknownException e) {
+            CodePushUtils.log(e);
+            promise.reject(e);
+        }
+    }
+
+    @ReactMethod
+    public void setLatestRollbackInfo(String packageHash, Promise promise) {
+        try {
+            mSettingsManager.setLatestRollbackInfo(packageHash);
+            promise.resolve(null);
+        } catch (CodePushUnknownException e) {
+            CodePushUtils.log(e);
+            promise.reject(e);
+        }
+    }
+
+    @ReactMethod
+    public void isFirstRun(String packageHash, Promise promise) {
+        try {
+            boolean isFirstRun = mCodePush.didUpdate()
+                    && packageHash != null
+                    && packageHash.length() > 0
+                    && packageHash.equals(mUpdateManager.getCurrentPackageHash());
+            promise.resolve(isFirstRun);
+        } catch(CodePushUnknownException e) {
+            CodePushUtils.log(e);
+            promise.reject(e);
+        }
+    }
+
+    @ReactMethod
+    public void notifyApplicationReady(Promise promise) {
+        try {
+            mSettingsManager.removePendingUpdate();
+            promise.resolve("");
+        } catch(CodePushUnknownException e) {
+            CodePushUtils.log(e);
+            promise.reject(e);
+        }
+    }
+
+    @ReactMethod
+    public void recordStatusReported(ReadableMap statusReport) {
+        try {
+            mTelemetryManager.recordStatusReported(statusReport);
+        } catch(CodePushUnknownException e) {
+            CodePushUtils.log(e);
+        }
+    }
+
+    @ReactMethod
+    public void saveStatusReportForRetry(ReadableMap statusReport) {
+        try {
+            mTelemetryManager.saveStatusReportForRetry(statusReport);
+        } catch(CodePushUnknownException e) {
+            CodePushUtils.log(e);
+        }
+    }
+
+    @ReactMethod
+    // Replaces the current bundle with the one downloaded from removeBundleUrl.
+    // It is only to be used during tests. No-ops if the test configuration flag is not set.
+    public void downloadAndReplaceCurrentBundle(String remoteBundleUrl) {
+        try {
+            if (mCodePush.isUsingTestConfiguration()) {
+                try {
+                    mUpdateManager.downloadAndReplaceCurrentBundle(remoteBundleUrl, mCodePush.getAssetsBundleFileName());
+                } catch (IOException e) {
+                    throw new CodePushUnknownException("Unable to replace current bundle", e);
+                }
+            }
+        } catch(CodePushUnknownException | CodePushMalformedDataException e) {
+            CodePushUtils.log(e);
+        }
+    }
+
+    /**
+     * This method clears CodePush's downloaded updates.
+     * It is needed to switch to a different deployment if the current deployment is more recent.
+     * Note: we don’t recommend to use this method in scenarios other than that (CodePush will call
+     * this method automatically when needed in other cases) as it could lead to unpredictable
+     * behavior.
+     */
+    @ReactMethod
+    public void clearUpdates() {
+        CodePushUtils.log("Clearing updates.");
+        mCodePush.clearUpdates();
+    }
+
+    /**
+     * Returns the base URL (file:// path) to the current CodePush update folder.
+     * This is used for asset resolution - similar to hot-updater's getBaseURL().
+     * Returns null if no CodePush update is currently installed.
+     * 
+     * The returned path can be used to construct full asset paths like:
+     * file:///data/.../CodePush/<hash>/build/drawable-xhdpi/__image.png
+     * 
+     * Note: Assets are in the build/ subfolder because we release with:
+     * code-push release ./build - which preserves the build folder structure.
+     */
+    @ReactMethod
+    public void getPackageFolderPath(Promise promise) {
+        try {
+            String packageFolder = mCodePush.getPackageFolder();
+            if (packageFolder != null) {
+                // Return as file:// URI for asset resolution
+                // Add /build because assets are in the build subfolder
+                String baseURL = "file://" + packageFolder + "/build";
+                CodePushUtils.log("getPackageFolderPath: " + baseURL);
+                promise.resolve(baseURL);
+            } else {
+                CodePushUtils.log("getPackageFolderPath: No CodePush update installed");
+                promise.resolve(null);
+            }
+        } catch (Exception e) {
+            CodePushUtils.log("Error getting package folder path: " + e.getMessage());
+            promise.resolve(null);
+        }
+    }
+
+    @ReactMethod
+    public void addListener(String eventName) {
+        // Set up any upstream listeners or background tasks as necessary
+    }
+
+    @ReactMethod
+    public void removeListeners(Integer count) {
+        // Remove upstream listeners, stop unnecessary background tasks
+    }
+}
